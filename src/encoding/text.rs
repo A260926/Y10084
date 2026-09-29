@@ -40,11 +40,11 @@
 use crate::encoding::{
     EncodeExemplarTime, EncodeExemplarValue, EncodeLabelSet, NativeHistogram, NoLabelSet,
 };
+use crate::encoding::descriptor_core::{Descriptor, LabelOrder, Scope};
 use crate::metrics::exemplar::Exemplar;
 use crate::metrics::MetricType;
-use crate::registry::{Prefix, Registry, Unit};
+use crate::registry::{Registry, Unit};
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -186,8 +186,7 @@ where
 
 pub(crate) struct DescriptorEncoder<'a> {
     writer: &'a mut dyn Write,
-    prefix: Option<&'a Prefix>,
-    labels: &'a [(Cow<'static, str>, Cow<'static, str>)],
+    scope: Scope<'a>,
 }
 
 impl std::fmt::Debug for DescriptorEncoder<'_> {
@@ -200,19 +199,13 @@ impl DescriptorEncoder<'_> {
     pub(crate) fn new(writer: &mut dyn Write) -> DescriptorEncoder<'_> {
         DescriptorEncoder {
             writer,
-            prefix: Default::default(),
-            labels: Default::default(),
+            scope: Default::default(),
         }
     }
 
-    pub(crate) fn with_prefix_and_labels<'s>(
-        &'s mut self,
-        prefix: Option<&'s Prefix>,
-        labels: &'s [(Cow<'static, str>, Cow<'static, str>)],
-    ) -> DescriptorEncoder<'s> {
+    pub(crate) fn with_scope<'s>(&'s mut self, scope: Scope<'s>) -> DescriptorEncoder<'s> {
         DescriptorEncoder {
-            prefix,
-            labels,
+            scope,
             writer: self.writer,
         }
     }
@@ -224,43 +217,23 @@ impl DescriptorEncoder<'_> {
         unit: Option<&'s Unit>,
         metric_type: MetricType,
     ) -> Result<MetricEncoder<'s>, std::fmt::Error> {
+        let descriptor = self.scope.descriptor(name, unit);
+
         self.writer.write_str("# HELP ")?;
-        if let Some(prefix) = self.prefix {
-            self.writer.write_str(prefix.as_str())?;
-            self.writer.write_str("_")?;
-        }
-        self.writer.write_str(name)?;
-        if let Some(unit) = unit {
-            self.writer.write_str("_")?;
-            self.writer.write_str(unit.as_str())?;
-        }
+        descriptor.write_name(self.writer)?;
         self.writer.write_str(" ")?;
         self.writer.write_str(help)?;
         self.writer.write_str("\n")?;
 
         self.writer.write_str("# TYPE ")?;
-        if let Some(prefix) = self.prefix {
-            self.writer.write_str(prefix.as_str())?;
-            self.writer.write_str("_")?;
-        }
-        self.writer.write_str(name)?;
-        if let Some(unit) = unit {
-            self.writer.write_str("_")?;
-            self.writer.write_str(unit.as_str())?;
-        }
+        descriptor.write_name(self.writer)?;
         self.writer.write_str(" ")?;
         self.writer.write_str(metric_type.as_str())?;
         self.writer.write_str("\n")?;
 
         if let Some(unit) = unit {
             self.writer.write_str("# UNIT ")?;
-            if let Some(prefix) = self.prefix {
-                self.writer.write_str(prefix.as_str())?;
-                self.writer.write_str("_")?;
-            }
-            self.writer.write_str(name)?;
-            self.writer.write_str("_")?;
-            self.writer.write_str(unit.as_str())?;
+            descriptor.write_name(self.writer)?;
             self.writer.write_str(" ")?;
             self.writer.write_str(unit.as_str())?;
             self.writer.write_str("\n")?;
@@ -268,10 +241,7 @@ impl DescriptorEncoder<'_> {
 
         Ok(MetricEncoder {
             writer: self.writer,
-            prefix: self.prefix,
-            name,
-            unit,
-            const_labels: self.labels,
+            descriptor,
             family_labels: None,
         })
     }
@@ -288,10 +258,7 @@ impl DescriptorEncoder<'_> {
 // TODO: Alternative solutions to the above are very much appreciated.
 pub(crate) struct MetricEncoder<'a> {
     writer: &'a mut dyn Write,
-    prefix: Option<&'a Prefix>,
-    name: &'a str,
-    unit: Option<&'a Unit>,
-    const_labels: &'a [(Cow<'static, str>, Cow<'static, str>)],
+    descriptor: Descriptor<'a>,
     family_labels: Option<&'a dyn super::EncodeLabelSet>,
 }
 
@@ -304,10 +271,10 @@ impl std::fmt::Debug for MetricEncoder<'_> {
         }
 
         f.debug_struct("Encoder")
-            .field("name", &self.name)
-            .field("prefix", &self.prefix)
-            .field("unit", &self.unit)
-            .field("const_labels", &self.const_labels)
+            .field("name", &self.descriptor.name())
+            .field("prefix", &self.descriptor.prefix())
+            .field("unit", &self.descriptor.unit())
+            .field("const_labels", &self.descriptor.const_labels())
             .field("labels", &labels.as_str())
             .finish()
     }
@@ -390,10 +357,7 @@ impl MetricEncoder<'_> {
 
         Ok(MetricEncoder {
             writer: self.writer,
-            prefix: self.prefix,
-            name: self.name,
-            unit: self.unit,
-            const_labels: self.const_labels,
+            descriptor: self.descriptor,
             family_labels: Some(label_set),
         })
     }
@@ -493,17 +457,7 @@ impl MetricEncoder<'_> {
         self.writer.write_str("\n")
     }
     fn write_prefix_name_unit(&mut self) -> Result<(), std::fmt::Error> {
-        if let Some(prefix) = self.prefix {
-            self.writer.write_str(prefix.as_str())?;
-            self.writer.write_str("_")?;
-        }
-        self.writer.write_str(self.name)?;
-        if let Some(unit) = self.unit {
-            self.writer.write_str("_")?;
-            self.writer.write_str(unit.as_str())?;
-        }
-
-        Ok(())
+        self.descriptor.write_name(self.writer)
     }
 
     fn write_suffix(&mut self, suffix: &'static str) -> Result<(), std::fmt::Error> {
@@ -519,20 +473,25 @@ impl MetricEncoder<'_> {
         &mut self,
         additional_labels: Option<&S>,
     ) -> Result<(), std::fmt::Error> {
-        if self.const_labels.is_empty()
-            && additional_labels.is_none()
-            && self.family_labels.is_none()
-        {
+        let const_labels = self.descriptor.const_labels();
+        let order = LabelOrder::new(
+            const_labels,
+            additional_labels.is_some(),
+            self.family_labels.is_some(),
+        );
+
+        if order.is_empty() {
             return Ok(());
         }
 
         self.writer.write_str("{")?;
 
-        self.const_labels
+        const_labels
+            .as_slice()
             .encode(&mut LabelSetEncoder::new(self.writer).into())?;
 
         if let Some(additional_labels) = additional_labels {
-            if !self.const_labels.is_empty() {
+            if order.separate_after_const() {
                 self.writer.write_str(",")?;
             }
 
@@ -561,7 +520,7 @@ impl MetricEncoder<'_> {
             // be prepended if one of the `Write` methods are actually called when attempting to write the family labels.
             // Therefore, wrap the writer on `Self` with a CommaPrependingWriter if other labels have been written and
             // there may be a need to prepend an extra comma before writing additional labels.
-            if !self.const_labels.is_empty() || additional_labels.is_some() {
+            if order.separate_before_family() {
                 let mut writer = CommaPrependingWriter {
                     writer: self.writer,
                     should_prepend: true,

@@ -30,13 +30,14 @@ pub mod openmetrics_data_model {
     include!(concat!(env!("OUT_DIR"), "/openmetrics.rs"));
 }
 
-use std::{borrow::Cow, collections::HashMap};
+use std::collections::HashMap;
 
 use crate::metrics::MetricType;
 use crate::registry::{Registry, Unit};
-use crate::{metrics::exemplar::Exemplar, registry::Prefix};
+use crate::metrics::exemplar::Exemplar;
 
 use super::{
+    descriptor_core::Scope,
     EncodeCounterValue, EncodeExemplarValue, EncodeGaugeValue, EncodeLabelSet, NativeHistogram,
 };
 
@@ -67,8 +68,7 @@ impl From<MetricType> for openmetrics_data_model::MetricType {
 #[derive(Debug)]
 pub(crate) struct DescriptorEncoder<'a> {
     metric_families: &'a mut Vec<openmetrics_data_model::MetricFamily>,
-    prefix: Option<&'a Prefix>,
-    labels: &'a [(Cow<'static, str>, Cow<'static, str>)],
+    scope: Scope<'a>,
 }
 
 impl DescriptorEncoder<'_> {
@@ -77,37 +77,27 @@ impl DescriptorEncoder<'_> {
     ) -> DescriptorEncoder<'_> {
         DescriptorEncoder {
             metric_families,
-            prefix: Default::default(),
-            labels: Default::default(),
+            scope: Default::default(),
         }
     }
 
-    pub(crate) fn with_prefix_and_labels<'s>(
-        &'s mut self,
-        prefix: Option<&'s Prefix>,
-        labels: &'s [(Cow<'static, str>, Cow<'static, str>)],
-    ) -> DescriptorEncoder<'s> {
+    pub(crate) fn with_scope<'s>(&'s mut self, scope: Scope<'s>) -> DescriptorEncoder<'s> {
         DescriptorEncoder {
-            prefix,
-            labels,
+            scope,
             metric_families: self.metric_families,
         }
     }
 
     pub fn encode_descriptor<'s>(
         &'s mut self,
-        name: &str,
+        name: &'s str,
         help: &str,
-        unit: Option<&Unit>,
+        unit: Option<&'s Unit>,
         metric_type: MetricType,
     ) -> Result<MetricEncoder<'s>, std::fmt::Error> {
+        let descriptor = self.scope.descriptor(name, unit);
         let family = openmetrics_data_model::MetricFamily {
-            name: {
-                match self.prefix {
-                    Some(prefix) => prefix.as_str().to_string() + "_" + name,
-                    None => name.to_string(),
-                }
-            },
+            name: descriptor.prefix_name_string(),
             r#type: {
                 let metric_type: openmetrics_data_model::MetricType = metric_type.into();
                 metric_type as i32
@@ -121,7 +111,7 @@ impl DescriptorEncoder<'_> {
             ..Default::default()
         };
         let mut labels = vec![];
-        self.labels.encode(
+        descriptor.const_labels().as_slice().encode(
             &mut LabelSetEncoder {
                 labels: &mut labels,
             }

@@ -36,16 +36,16 @@ pub mod prometheus_data_model {
 
 use prost::Message;
 use std::{
-    borrow::Cow,
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::metrics::MetricType;
 use crate::registry::{Registry, Unit};
-use crate::{metrics::exemplar::Exemplar, registry::Prefix};
+use crate::metrics::exemplar::Exemplar;
 
 use super::{
+    descriptor_core::{Descriptor, Scope},
     EncodeCounterValue, EncodeExemplarValue, EncodeGaugeValue, EncodeLabelSet, NativeHistogram,
 };
 
@@ -126,25 +126,8 @@ impl From<MetricType> for prometheus_data_model::MetricType {
     }
 }
 
-fn metric_family_name(
-    prefix: Option<&Prefix>,
-    name: &str,
-    unit: Option<&Unit>,
-    metric_type: MetricType,
-) -> String {
-    let mut full_name = String::new();
-
-    if let Some(prefix) = prefix {
-        full_name.push_str(prefix.as_str());
-        full_name.push('_');
-    }
-
-    full_name.push_str(name);
-
-    if let Some(unit) = unit {
-        full_name.push('_');
-        full_name.push_str(unit.as_str());
-    }
+fn metric_family_name(descriptor: &Descriptor, metric_type: MetricType) -> String {
+    let mut full_name = descriptor.name_string();
 
     match metric_type {
         MetricType::Counter => full_name.push_str("_total"),
@@ -159,8 +142,7 @@ fn metric_family_name(
 #[derive(Debug)]
 pub(crate) struct DescriptorEncoder<'a> {
     metric_families: &'a mut Vec<prometheus_data_model::MetricFamily>,
-    prefix: Option<&'a Prefix>,
-    labels: &'a [(Cow<'static, str>, Cow<'static, str>)],
+    scope: Scope<'a>,
 }
 
 impl DescriptorEncoder<'_> {
@@ -169,32 +151,27 @@ impl DescriptorEncoder<'_> {
     ) -> DescriptorEncoder<'_> {
         DescriptorEncoder {
             metric_families,
-            prefix: Default::default(),
-            labels: Default::default(),
+            scope: Default::default(),
         }
     }
 
-    pub(crate) fn with_prefix_and_labels<'s>(
-        &'s mut self,
-        prefix: Option<&'s Prefix>,
-        labels: &'s [(Cow<'static, str>, Cow<'static, str>)],
-    ) -> DescriptorEncoder<'s> {
+    pub(crate) fn with_scope<'s>(&'s mut self, scope: Scope<'s>) -> DescriptorEncoder<'s> {
         DescriptorEncoder {
-            prefix,
-            labels,
+            scope,
             metric_families: self.metric_families,
         }
     }
 
     pub fn encode_descriptor<'s>(
         &'s mut self,
-        name: &str,
+        name: &'s str,
         help: &str,
-        unit: Option<&Unit>,
+        unit: Option<&'s Unit>,
         metric_type: MetricType,
     ) -> Result<MetricEncoder<'s>, std::fmt::Error> {
+        let descriptor = self.scope.descriptor(name, unit);
         let family = prometheus_data_model::MetricFamily {
-            name: metric_family_name(self.prefix, name, unit, metric_type),
+            name: metric_family_name(&descriptor, metric_type),
             r#type: prometheus_data_model::MetricType::from(metric_type) as i32,
             unit: unit
                 .map(|unit| unit.as_str().to_string())
@@ -203,7 +180,7 @@ impl DescriptorEncoder<'_> {
             ..Default::default()
         };
         let mut labels = vec![];
-        self.labels.encode(
+        descriptor.const_labels().as_slice().encode(
             &mut LabelSetEncoder {
                 labels: &mut labels,
             }

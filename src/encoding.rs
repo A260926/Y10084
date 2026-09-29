@@ -6,7 +6,7 @@ pub use prometheus_client_derive_encode::*;
 
 use crate::metrics::exemplar::Exemplar;
 use crate::metrics::MetricType;
-use crate::registry::{Prefix, Unit};
+use crate::registry::Unit;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -27,6 +27,7 @@ pub mod openmetrics_protobuf;
 #[cfg(feature = "prometheus_protobuf")]
 #[cfg_attr(docsrs, doc(cfg(feature = "prometheus_protobuf")))]
 pub mod prometheus_protobuf;
+pub(crate) mod descriptor_core;
 pub mod text;
 
 #[cfg(feature = "openmetrics_protobuf")]
@@ -154,18 +155,11 @@ impl<'a> From<prometheus_protobuf::DescriptorEncoder<'a>> for DescriptorEncoder<
 }
 
 impl DescriptorEncoder<'_> {
-    pub(crate) fn with_prefix_and_labels<'s>(
+    pub(crate) fn with_scope<'s>(
         &'s mut self,
-        prefix: Option<&'s Prefix>,
-        labels: &'s [(Cow<'static, str>, Cow<'static, str>)],
-        // TODO: result needed?
+        scope: descriptor_core::Scope<'s>,
     ) -> DescriptorEncoder<'s> {
-        for_both_mut!(
-            self,
-            DescriptorEncoderInner,
-            e,
-            e.with_prefix_and_labels(prefix, labels).into()
-        )
+        for_both_mut!(self, DescriptorEncoderInner, e, e.with_scope(scope).into())
     }
 
     /// Encode a descriptor.

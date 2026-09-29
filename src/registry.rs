@@ -287,9 +287,13 @@ impl Registry {
     }
 
     pub(crate) fn encode(&self, encoder: &mut DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let scope = crate::encoding::descriptor_core::Scope::new(
+            self.prefix.as_ref(),
+            &self.labels,
+        );
+
         for (descriptor, metric) in self.metrics.iter().filter(|(_, m)| !m.is_empty()) {
-            let mut descriptor_encoder =
-                encoder.with_prefix_and_labels(self.prefix.as_ref(), &self.labels);
+            let mut descriptor_encoder = encoder.with_scope(scope);
             let metric_encoder = descriptor_encoder.encode_descriptor(
                 &descriptor.name,
                 &descriptor.help,
@@ -300,8 +304,7 @@ impl Registry {
         }
 
         for collector in self.collectors.iter() {
-            let descriptor_encoder =
-                encoder.with_prefix_and_labels(self.prefix.as_ref(), &self.labels);
+            let descriptor_encoder = encoder.with_scope(scope);
             collector.encode(descriptor_encoder)?;
         }
 

@@ -36,14 +36,17 @@ pub mod prometheus_data_model {
 
 use prost::Message;
 use std::{
-    borrow::Cow,
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::collector::Collector;
+use crate::descriptor::{
+    base_name, encode_const_labels, ConstLabel, DescriptorSink, DescriptorView,
+};
+use crate::metrics::exemplar::Exemplar;
 use crate::metrics::MetricType;
 use crate::registry::{Registry, Unit};
-use crate::{metrics::exemplar::Exemplar, registry::Prefix};
 
 use super::{
     EncodeCounterValue, EncodeExemplarValue, EncodeGaugeValue, EncodeLabelSet, NativeHistogram,
@@ -55,7 +58,8 @@ pub fn encode(
     registry: &Registry,
 ) -> Result<Vec<prometheus_data_model::MetricFamily>, std::fmt::Error> {
     let mut metric_families = Vec::new();
-    let mut descriptor_encoder = DescriptorEncoder::new(&mut metric_families).into();
+    let mut descriptor_encoder =
+        super::DescriptorEncoder::from(DescriptorEncoder::new(&mut metric_families));
     registry.encode(&mut descriptor_encoder)?;
     Ok(metric_families)
 }
@@ -126,41 +130,12 @@ impl From<MetricType> for prometheus_data_model::MetricType {
     }
 }
 
-fn metric_family_name(
-    prefix: Option<&Prefix>,
-    name: &str,
-    unit: Option<&Unit>,
-    metric_type: MetricType,
-) -> String {
-    let mut full_name = String::new();
-
-    if let Some(prefix) = prefix {
-        full_name.push_str(prefix.as_str());
-        full_name.push('_');
-    }
-
-    full_name.push_str(name);
-
-    if let Some(unit) = unit {
-        full_name.push('_');
-        full_name.push_str(unit.as_str());
-    }
-
-    match metric_type {
-        MetricType::Counter => full_name.push_str("_total"),
-        MetricType::Info => full_name.push_str("_info"),
-        MetricType::Gauge | MetricType::Histogram | MetricType::Unknown => {}
-    }
-
-    full_name
-}
-
 /// Metric Descriptor encoder for protobuf encoding.
 #[derive(Debug)]
 pub(crate) struct DescriptorEncoder<'a> {
     metric_families: &'a mut Vec<prometheus_data_model::MetricFamily>,
-    prefix: Option<&'a Prefix>,
-    labels: &'a [(Cow<'static, str>, Cow<'static, str>)],
+    prefixes: &'a [&'a str],
+    const_labels: &'a [&'a [ConstLabel]],
 }
 
 impl DescriptorEncoder<'_> {
@@ -169,45 +144,94 @@ impl DescriptorEncoder<'_> {
     ) -> DescriptorEncoder<'_> {
         DescriptorEncoder {
             metric_families,
-            prefix: Default::default(),
-            labels: Default::default(),
+            prefixes: &[],
+            const_labels: &[],
         }
     }
 
-    pub(crate) fn with_prefix_and_labels<'s>(
-        &'s mut self,
-        prefix: Option<&'s Prefix>,
-        labels: &'s [(Cow<'static, str>, Cow<'static, str>)],
-    ) -> DescriptorEncoder<'s> {
+    pub(crate) fn with_prefix_and_labels<'r>(
+        &'r mut self,
+        prefixes: &'r [&'r str],
+        const_labels: &'r [&'r [ConstLabel]],
+    ) -> DescriptorEncoder<'r> {
         DescriptorEncoder {
-            prefix,
-            labels,
+            prefixes,
+            const_labels,
             metric_families: self.metric_families,
         }
     }
 
     pub fn encode_descriptor<'s>(
         &'s mut self,
-        name: &str,
+        name: &'s str,
         help: &str,
-        unit: Option<&Unit>,
+        unit: Option<&'s Unit>,
         metric_type: MetricType,
     ) -> Result<MetricEncoder<'s>, std::fmt::Error> {
+        let view = DescriptorView {
+            name,
+            help,
+            unit,
+            metric_type,
+        };
+        self.encode_visited(view)
+    }
+}
+
+impl DescriptorSink for DescriptorEncoder<'_> {
+    fn emit_metric(
+        &mut self,
+        descriptor: DescriptorView<'_>,
+        prefixes: &[&str],
+        const_labels: &[&[ConstLabel]],
+        metric: &dyn super::EncodeMetric,
+    ) -> Result<(), std::fmt::Error> {
+        let mut scoped = self.with_prefix_and_labels(prefixes, const_labels);
+        let metric_encoder = scoped.encode_visited(descriptor)?;
+        metric.encode(metric_encoder.into())
+    }
+
+    fn emit_collector(
+        &mut self,
+        prefixes: &[&str],
+        const_labels: &[&[ConstLabel]],
+        collector: &dyn Collector,
+    ) -> Result<(), std::fmt::Error> {
+        let descriptor_encoder = self.with_prefix_and_labels(prefixes, const_labels);
+        collector.encode(descriptor_encoder.into())
+    }
+}
+
+impl DescriptorEncoder<'_> {
+    fn encode_visited<'s>(
+        &'s mut self,
+        descriptor: DescriptorView<'_>,
+    ) -> Result<MetricEncoder<'s>, std::fmt::Error> {
+        let prefixes = self.prefixes;
+        let const_labels = self.const_labels;
+        let mut full_name = base_name(descriptor, prefixes, true);
+        match descriptor.metric_type {
+            MetricType::Counter => full_name.push_str("_total"),
+            MetricType::Info => full_name.push_str("_info"),
+            MetricType::Gauge | MetricType::Histogram | MetricType::Unknown => {}
+        }
         let family = prometheus_data_model::MetricFamily {
-            name: metric_family_name(self.prefix, name, unit, metric_type),
-            r#type: prometheus_data_model::MetricType::from(metric_type) as i32,
-            unit: unit
+            name: full_name,
+            r#type: prometheus_data_model::MetricType::from(descriptor.metric_type) as i32,
+            unit: descriptor
+                .unit
                 .map(|unit| unit.as_str().to_string())
                 .unwrap_or_default(),
-            help: help.to_string(),
+            help: descriptor.help.to_string(),
             ..Default::default()
         };
         let mut labels = vec![];
-        self.labels.encode(
+        encode_const_labels(
             &mut LabelSetEncoder {
                 labels: &mut labels,
             }
             .into(),
+            const_labels,
         )?;
         self.metric_families.push(family);
 
@@ -217,7 +241,7 @@ impl DescriptorEncoder<'_> {
                 .last_mut()
                 .expect("previous push")
                 .metric,
-            metric_type,
+            metric_type: descriptor.metric_type,
             labels,
         })
     }

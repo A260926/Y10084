@@ -86,6 +86,8 @@
 //! [examples]: https://github.com/prometheus/client_rust/tree/master/examples
 
 pub mod collector;
+#[doc(hidden)]
+pub mod descriptor;
 pub mod encoding;
 pub mod metrics;
 pub mod registry;

@@ -2,10 +2,9 @@
 //!
 //! See [`Registry`] for details.
 
-use std::borrow::Cow;
-
 use crate::collector::Collector;
-use crate::encoding::{DescriptorEncoder, EncodeMetric};
+use crate::descriptor::{ConstLabel, DescriptorSink, DescriptorView};
+use crate::encoding::EncodeMetric;
 
 /// A metric registry.
 ///
@@ -59,8 +58,8 @@ use crate::encoding::{DescriptorEncoder, EncodeMetric};
 /// ```
 #[derive(Debug, Default)]
 pub struct Registry {
-    prefix: Option<Prefix>,
-    labels: Vec<(Cow<'static, str>, Cow<'static, str>)>,
+    prefix: Option<String>,
+    labels: Vec<ConstLabel>,
     metrics: Vec<(Descriptor, Box<dyn Metric>)>,
     collectors: Vec<Box<dyn Collector>>,
     sub_registries: Vec<Registry>,
@@ -70,15 +69,13 @@ impl Registry {
     /// Creates a new default [`Registry`] with the given prefix.
     pub fn with_prefix(prefix: impl Into<String>) -> Self {
         Self {
-            prefix: Some(Prefix(prefix.into())),
+            prefix: Some(prefix.into()),
             ..Default::default()
         }
     }
 
     /// Creates a new default [`Registry`] with the given labels.
-    pub fn with_labels(
-        labels: impl Iterator<Item = (Cow<'static, str>, Cow<'static, str>)>,
-    ) -> Self {
+    pub fn with_labels(labels: impl Iterator<Item = ConstLabel>) -> Self {
         Self {
             labels: labels.into_iter().collect(),
             ..Default::default()
@@ -88,10 +85,10 @@ impl Registry {
     /// Creates a new default [`Registry`] with the given prefix and labels.
     pub fn with_prefix_and_labels(
         prefix: impl Into<String>,
-        labels: impl Iterator<Item = (Cow<'static, str>, Cow<'static, str>)>,
+        labels: impl Iterator<Item = ConstLabel>,
     ) -> Self {
         Self {
-            prefix: Some(Prefix(prefix.into())),
+            prefix: Some(prefix.into()),
             labels: labels.into_iter().collect(),
             ..Default::default()
         }
@@ -243,10 +240,8 @@ impl Registry {
     /// but namespacing with a label instead of a metric name prefix.
     pub fn sub_registry_with_prefix<P: AsRef<str>>(&mut self, prefix: P) -> &mut Self {
         let sub_registry = Registry {
-            prefix: Some(Prefix(
-                self.prefix.clone().map(|p| p.0 + "_").unwrap_or_default() + prefix.as_ref(),
-            )),
-            labels: self.labels.clone(),
+            prefix: Some(prefix.as_ref().to_owned()),
+            labels: Vec::new(),
             ..Default::default()
         };
 
@@ -254,24 +249,18 @@ impl Registry {
     }
 
     /// Like [`Registry::sub_registry_with_prefix`] but with a label instead.
-    pub fn sub_registry_with_label(
-        &mut self,
-        label: (Cow<'static, str>, Cow<'static, str>),
-    ) -> &mut Self {
+    pub fn sub_registry_with_label(&mut self, label: ConstLabel) -> &mut Self {
         self.sub_registry_with_labels(std::iter::once(label))
     }
 
     /// Like [`Registry::sub_registry_with_prefix`] but with multiple labels instead.
     pub fn sub_registry_with_labels(
         &mut self,
-        labels: impl Iterator<Item = (Cow<'static, str>, Cow<'static, str>)>,
+        labels: impl Iterator<Item = ConstLabel>,
     ) -> &mut Self {
-        let mut new_labels = self.labels.clone();
-        new_labels.extend(labels);
-
         let sub_registry = Registry {
-            prefix: self.prefix.clone(),
-            labels: new_labels,
+            prefix: None,
+            labels: labels.into_iter().collect(),
             ..Default::default()
         };
 
@@ -286,46 +275,71 @@ impl Registry {
             .expect("sub_registries not to be empty.")
     }
 
-    pub(crate) fn encode(&self, encoder: &mut DescriptorEncoder) -> Result<(), std::fmt::Error> {
+    pub(crate) fn encode(&self, sink: &mut dyn DescriptorSink) -> Result<(), std::fmt::Error> {
+        self.visit(sink, &mut Vec::new(), &mut Vec::new())
+    }
+
+    /// Drives the writer-independent traversal with an arbitrary sink.
+    ///
+    /// Exposed for in-crate tests and `test-util` consumers that want to
+    /// observe descriptors without producing a concrete exposition format.
+    #[cfg(any(test, feature = "test-util"))]
+    #[doc(hidden)]
+    pub fn visit_with(&self, sink: &mut dyn DescriptorSink) -> Result<(), std::fmt::Error> {
+        self.encode(sink)
+    }
+
+    /// Walks the registry tree, passing descriptor and label chains through the
+    /// writer-independent traversal core.
+    ///
+    /// The prefix and label stacks are borrowed references, i.e. nested
+    /// registries neither re-allocate the complete concatenated prefix nor copy
+    /// the merged const label set.
+    fn visit<'a>(
+        &'a self,
+        sink: &mut dyn DescriptorSink,
+        prefixes: &mut Vec<&'a str>,
+        const_labels: &mut Vec<&'a [ConstLabel]>,
+    ) -> Result<(), std::fmt::Error> {
+        let pushed_prefix = if let Some(prefix) = &self.prefix {
+            prefixes.push(prefix.as_str());
+            true
+        } else {
+            false
+        };
+        let pushed_labels = if !self.labels.is_empty() {
+            const_labels.push(self.labels.as_slice());
+            true
+        } else {
+            false
+        };
+
         for (descriptor, metric) in self.metrics.iter().filter(|(_, m)| !m.is_empty()) {
-            let mut descriptor_encoder =
-                encoder.with_prefix_and_labels(self.prefix.as_ref(), &self.labels);
-            let metric_encoder = descriptor_encoder.encode_descriptor(
-                &descriptor.name,
-                &descriptor.help,
-                descriptor.unit.as_ref(),
-                EncodeMetric::metric_type(metric.as_ref()),
-            )?;
-            metric.encode(metric_encoder)?;
+            let view = DescriptorView {
+                name: &descriptor.name,
+                help: &descriptor.help,
+                unit: descriptor.unit.as_ref(),
+                metric_type: EncodeMetric::metric_type(metric.as_ref()),
+            };
+            sink.emit_metric(view, prefixes, const_labels, metric.as_ref())?;
         }
 
         for collector in self.collectors.iter() {
-            let descriptor_encoder =
-                encoder.with_prefix_and_labels(self.prefix.as_ref(), &self.labels);
-            collector.encode(descriptor_encoder)?;
+            sink.emit_collector(prefixes, const_labels, collector.as_ref())?;
         }
 
         for registry in self.sub_registries.iter() {
-            registry.encode(encoder)?;
+            registry.visit(sink, prefixes, const_labels)?;
+        }
+
+        if pushed_labels {
+            const_labels.pop();
+        }
+        if pushed_prefix {
+            prefixes.pop();
         }
 
         Ok(())
-    }
-}
-
-/// Metric prefix
-#[derive(Clone, Debug)]
-pub(crate) struct Prefix(String);
-
-impl Prefix {
-    pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-}
-
-impl From<String> for Prefix {
-    fn from(s: String) -> Self {
-        Prefix(s)
     }
 }
 

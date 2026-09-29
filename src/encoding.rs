@@ -4,9 +4,11 @@
 
 pub use prometheus_client_derive_encode::*;
 
+use crate::collector::Collector;
+use crate::descriptor::{ConstLabel, DescriptorSink, DescriptorView};
 use crate::metrics::exemplar::Exemplar;
 use crate::metrics::MetricType;
-use crate::registry::{Prefix, Unit};
+use crate::registry::Unit;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -154,20 +156,6 @@ impl<'a> From<prometheus_protobuf::DescriptorEncoder<'a>> for DescriptorEncoder<
 }
 
 impl DescriptorEncoder<'_> {
-    pub(crate) fn with_prefix_and_labels<'s>(
-        &'s mut self,
-        prefix: Option<&'s Prefix>,
-        labels: &'s [(Cow<'static, str>, Cow<'static, str>)],
-        // TODO: result needed?
-    ) -> DescriptorEncoder<'s> {
-        for_both_mut!(
-            self,
-            DescriptorEncoderInner,
-            e,
-            e.with_prefix_and_labels(prefix, labels).into()
-        )
-    }
-
     /// Encode a descriptor.
     pub fn encode_descriptor<'s>(
         &'s mut self,
@@ -181,6 +169,37 @@ impl DescriptorEncoder<'_> {
             DescriptorEncoderInner,
             e,
             Ok(e.encode_descriptor(name, help, unit, metric_type)?.into())
+        )
+    }
+}
+
+impl DescriptorSink for DescriptorEncoder<'_> {
+    fn emit_metric(
+        &mut self,
+        descriptor: DescriptorView<'_>,
+        prefixes: &[&str],
+        const_labels: &[&[ConstLabel]],
+        metric: &dyn EncodeMetric,
+    ) -> Result<(), std::fmt::Error> {
+        for_both_mut!(
+            self,
+            DescriptorEncoderInner,
+            e,
+            e.emit_metric(descriptor, prefixes, const_labels, metric)
+        )
+    }
+
+    fn emit_collector(
+        &mut self,
+        prefixes: &[&str],
+        const_labels: &[&[ConstLabel]],
+        collector: &dyn Collector,
+    ) -> Result<(), std::fmt::Error> {
+        for_both_mut!(
+            self,
+            DescriptorEncoderInner,
+            e,
+            e.emit_collector(prefixes, const_labels, collector)
         )
     }
 }
